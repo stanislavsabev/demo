@@ -1,213 +1,90 @@
 """
-Usage examples for each service in the financial system.
+Usage examples for the async EventsClient.
 
-These are NOT runnable as-is — they show how each service integrates
-with events-lib. Copy the patterns relevant to your service.
+All handlers are async — they can freely await websocket sends,
+Redis operations, HTTP calls, etc.
 """
 
 # =====================================================================
-# EXAMPLE 1: Data Service (Producer)
-#
-# This service owns the database. When data changes, it produces events.
-# Uses the outbox pattern for consistency (see note below).
+# EXAMPLE 1: UI Backend — async handlers for websocket push
 # =====================================================================
 
 from events_lib import (
+    EventsClient,
+    EventEnvelope,
+    EventType,
+    KafkaConfig,
+    SimulationProblemEvent,
+    SimulationProblemType,
+    ServiceStatusEvent,
+    ServiceHealthStatus,
     DataChangeEvent,
     DataChangeType,
     DataGroupType,
-    EventsClient,
-    KafkaConfig,
     UserUpdatedEvent,
     PermissionsUpdatedEvent,
 )
-
-
-def data_service_example() -> None:
-    # Producer-only — no consumer_group needed
-    client = EventsClient(
-        config=KafkaConfig(),
-        service_name="data-service",
-    )
-
-    # After writing a fixing to the DB, emit the event:
-    event = DataChangeEvent(
-        source_service="data-service",
-        data_group=DataGroupType.STATIC,
-        data_key="fixing:USD/EUR/2024-03-15",
-        change_type=DataChangeType.UPDATED,
-        changed_by="admin@firm.com",
-        details={"old_rate": 1.0812, "new_rate": 1.0825},
-    )
-    client.produce(event)
-
-    # User profile update
-    event = UserUpdatedEvent(
-        source_service="data-service",
-        user_id="usr-456",
-        changed_fields=["email", "display_name"],
-    )
-    client.produce(event)
-
-    # Permission change
-    event = PermissionsUpdatedEvent(
-        source_service="data-service",
-        user_id="usr-456",
-        scope="role:risk-viewer",
-        action="granted",
-    )
-    client.produce(event)
-
-    client.flush()
-
-
-# =====================================================================
-# EXAMPLE 2: UI Backend (Consumer)
-#
-# Holds websocket connections with cached user info. Needs to react
-# to user/permission changes and simulation problems.
-# =====================================================================
-
-from events_lib import (
-    EventEnvelope,
-    EventType,
-)
-from events_lib.models.base import EventMeta
 from events_lib.models.user_events import UserUpdatedPayload, PermissionsUpdatedPayload
 from events_lib.models.simulation_events import SimulationProblemPayload
+from events_lib.models.data_events import DataChangePayload
 
 
 class ConnectionManager:
     """Simplified — manages WS connections per user."""
 
-    def invalidate_user_cache(self, user_id: str, fields: list[str]) -> None: ...
-    def invalidate_permissions(self, user_id: str, scope: str) -> None: ...
-    def notify_simulation_problem(
+    async def invalidate_user_cache(self, user_id: str, fields: list[str]) -> None:
+        # await redis.delete(f"user:{user_id}")
+        # await self._ws_connections[user_id].send_json({...})
+        ...
+
+    async def invalidate_permissions(self, user_id: str, scope: str) -> None: ...
+
+    async def notify_simulation_problem(
         self, simulation_name: str, message: str
-    ) -> None: ...
+    ) -> None:
+        # Push to all connected users watching this simulation
+        # await self._broadcast_to_watchers(simulation_name, {...})
+        ...
 
 
-def ui_backend_example() -> None:
-    conn_manager = ConnectionManager()
+def build_ui_backend_handlers(conn_manager: ConnectionManager):
+    """
+    Factory that returns async handlers closed over the ConnectionManager.
 
-    def handle_user_updated(envelope: EventEnvelope) -> None:
+    This pattern keeps handler functions testable — inject a mock
+    ConnectionManager in tests.
+    """
+
+    async def handle_user_updated(envelope: EventEnvelope) -> None:
         payload: UserUpdatedPayload = envelope.payload  # type: ignore[assignment]
-        conn_manager.invalidate_user_cache(
+        await conn_manager.invalidate_user_cache(
             user_id=payload.user_id,
             fields=payload.changed_fields,
         )
 
-    def handle_permissions_updated(envelope: EventEnvelope) -> None:
+    async def handle_permissions_updated(envelope: EventEnvelope) -> None:
         payload: PermissionsUpdatedPayload = envelope.payload  # type: ignore[assignment]
-        conn_manager.invalidate_permissions(
+        await conn_manager.invalidate_permissions(
             user_id=payload.user_id,
             scope=payload.scope,
         )
 
-    def handle_simulation_problem(envelope: EventEnvelope) -> None:
+    async def handle_simulation_problem(envelope: EventEnvelope) -> None:
         payload: SimulationProblemPayload = envelope.payload  # type: ignore[assignment]
-        conn_manager.notify_simulation_problem(
+        await conn_manager.notify_simulation_problem(
             simulation_name=payload.simulation_name,
             message=f"[{payload.problem_type}] {payload.message}",
         )
 
-    client = EventsClient(
-        config=KafkaConfig(),
-        service_name="ui-backend",
-        consumer_group="ui-backend-group",
-    )
-
-    client.on(EventType.USER_UPDATED, handle_user_updated)
-    client.on(EventType.PERMISSIONS_UPDATED, handle_permissions_updated)
-    client.on(EventType.SIMULATION_PROBLEM, handle_simulation_problem)
-
-    client.start()
-    # ... FastAPI lifespan keeps this alive ...
-    # client.stop() on shutdown
+    return {
+        EventType.USER_UPDATED: handle_user_updated,
+        EventType.PERMISSIONS_UPDATED: handle_permissions_updated,
+        EventType.SIMULATION_PROBLEM: handle_simulation_problem,
+    }
 
 
 # =====================================================================
-# EXAMPLE 3: Orchestrator (Producer + Consumer)
-#
-# Consumes data-change events to propagate to simulations.
-# Produces simulation-problem events when things go wrong.
-# Also produces heartbeat status events.
-# =====================================================================
-
-from events_lib import (
-    SimulationProblemEvent,
-    SimulationProblemType,
-    ServiceStatusEvent,
-    ServiceHealthStatus,
-)
-from events_lib.models.data_events import DataChangePayload
-
-
-class SimulationRegistry:
-    """Simplified — tracks active simulations."""
-
-    def notify_data_change(
-        self, data_group: str, data_key: str
-    ) -> None: ...
-
-
-def orchestrator_example() -> None:
-    sim_registry = SimulationRegistry()
-
-    # This client is both producer AND consumer
-    client = EventsClient(
-        config=KafkaConfig(),
-        service_name="orchestrator",
-        consumer_group="orchestrator-group",
-    )
-
-    def handle_data_change(envelope: EventEnvelope) -> None:
-        payload: DataChangePayload = envelope.payload  # type: ignore[assignment]
-        sim_registry.notify_data_change(
-            data_group=payload.data_group,
-            data_key=payload.data_key,
-        )
-
-    client.on(EventType.DATA_CHANGE, handle_data_change)
-    client.start()
-
-    # ... later, when a simulation fails:
-    event = SimulationProblemEvent(
-        source_service="orchestrator",
-        simulation_name="EOD-VaR-2024Q1",
-        problem_type=SimulationProblemType.CALCULATOR_FAILURE,
-        message="Calculator calc-risk-007 crashed during VaR aggregation",
-        calculator_id="calc-risk-007",
-        context={
-            "portfolio": "EMEA-FX-OPTIONS",
-            "last_trade_processed": "TRD-2024-88421",
-            "error": "ZeroDivisionError in risk_factor_sensitivity()",
-        },
-        is_recoverable=False,
-    )
-    client.produce(event)
-
-    # Periodic heartbeat (call from a background task)
-    status = ServiceStatusEvent(
-        source_service="orchestrator",
-        service_name="orchestrator",
-        instance_id="orch-pod-3a",
-        status=ServiceHealthStatus.HEALTHY,
-        metrics={
-            "active_simulations": 12,
-            "active_calculators": 48,
-            "avg_calc_time_ms": 23.5,
-            "pending_data_events": 3,
-        },
-        uptime_seconds=86400.0,
-    )
-    client.produce(status)
-
-
-# =====================================================================
-# EXAMPLE 4: FastAPI integration via lifespan
-#
-# Shows how to wire EventsClient into FastAPI's startup/shutdown cycle.
+# EXAMPLE 2: FastAPI lifespan integration
 # =====================================================================
 
 from contextlib import asynccontextmanager
@@ -215,40 +92,139 @@ from collections.abc import AsyncIterator
 # from fastapi import FastAPI  # uncomment in real code
 
 
-def fastapi_integration_example():
+def fastapi_lifespan_example():
     """
-    Demonstrates the recommended FastAPI integration pattern.
+    Recommended pattern for wiring EventsClient into FastAPI.
+
+    The client starts on app startup and stops on app shutdown.
+    Both produce() and all handlers are async — no thread bridging.
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Startup
-        events_client = EventsClient(
+        conn_manager = ConnectionManager()
+
+        client = EventsClient(
             config=KafkaConfig(),
             service_name="ui-backend",
             consumer_group="ui-backend-group",
         )
 
-        # Register handlers
-        events_client.on(EventType.USER_UPDATED, handle_user_updated)
-        events_client.on(EventType.SIMULATION_PROBLEM, handle_sim_problem)
+        # Register async handlers
+        handlers = build_ui_backend_handlers(conn_manager)
+        for event_type, handler in handlers.items():
+            client.on(event_type, handler)
 
-        # Start consuming
-        events_client.start()
+        # Start consuming — poll thread + dispatch task start here
+        await client.start()
 
-        # Make client available via app.state
-        app.state.events_client = events_client
+        # Make client available via app.state for producing from routes
+        app.state.events_client = client
 
         yield
 
-        # Shutdown
-        events_client.stop()
+        # Graceful shutdown — drains queue, commits offsets, leaves group
+        await client.stop()
 
     app = FastAPI(lifespan=lifespan)
 
-    @app.post("/api/admin/force-recalc")
-    async def force_recalc(simulation_name: str):
-        # Access the client from app.state to produce events
-        client: EventsClient = app.state.events_client
-        # ... produce event ...
+
+    # Producing from a route handler — fully async, no blocking:
+
+    @app.post("/api/admin/update-user/{user_id}")
+    async def update_user(user_id: str, request: Request):
+        # ... update database ...
+
+        client: EventsClient = request.app.state.events_client
+        event = UserUpdatedEvent(
+            source_service="ui-backend",
+            user_id=user_id,
+            changed_fields=["email"],
+        )
+        await client.produce(event)  # Non-blocking
+
+        return {"status": "updated"}
+    """
+    pass
+
+
+# =====================================================================
+# EXAMPLE 3: Orchestrator — both produces and consumes
+# =====================================================================
+
+class SimulationRegistry:
+    """Simplified — tracks active simulations."""
+
+    async def notify_data_change(self, data_group: str, data_key: str) -> None:
+        # Propagate to affected simulations and calculators
+        ...
+
+
+async def orchestrator_example() -> None:
+    """
+    The Orchestrator is both consumer (data changes) and producer
+    (simulation problems, status heartbeats).
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        sim_registry = SimulationRegistry()
+
+        client = EventsClient(
+            config=KafkaConfig(),
+            service_name="orchestrator",
+            consumer_group="orchestrator-group",
+        )
+
+        async def handle_data_change(envelope: EventEnvelope) -> None:
+            payload: DataChangePayload = envelope.payload
+            await sim_registry.notify_data_change(
+                data_group=payload.data_group,
+                data_key=payload.data_key,
+            )
+
+        client.on(EventType.DATA_CHANGE, handle_data_change)
+        await client.start()
+        app.state.events_client = client
+
+        yield
+
+        await client.stop()
+
+    # Later, when a simulation fails — produce from a route or internal logic:
+
+    async def report_simulation_failure(client: EventsClient) -> None:
+        event = SimulationProblemEvent(
+            source_service="orchestrator",
+            simulation_name="EOD-VaR-2024Q1",
+            problem_type=SimulationProblemType.CALCULATOR_FAILURE,
+            message="Calculator calc-risk-007 crashed during VaR aggregation",
+            calculator_id="calc-risk-007",
+            context={
+                "portfolio": "EMEA-FX-OPTIONS",
+                "last_trade_processed": "TRD-2024-88421",
+            },
+            is_recoverable=False,
+        )
+        await client.produce(event)
+
+
+    # Periodic heartbeat — run as a background task:
+
+    async def heartbeat_loop(client: EventsClient) -> None:
+        import asyncio
+        while True:
+            status = ServiceStatusEvent(
+                source_service="orchestrator",
+                service_name="orchestrator",
+                instance_id="orch-pod-3a",
+                status=ServiceHealthStatus.HEALTHY,
+                metrics={
+                    "active_simulations": 12,
+                    "active_calculators": 48,
+                    "avg_calc_time_ms": 23.5,
+                },
+                uptime_seconds=86400.0,
+            )
+            await client.produce(status)
+            await asyncio.sleep(30)  # Every 30 seconds
     """
     pass
