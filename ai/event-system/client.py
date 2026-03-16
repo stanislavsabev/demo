@@ -95,6 +95,8 @@ class EventsClient:
         self._queue: asyncio.Queue[_QueueItem | None] = asyncio.Queue(
             maxsize=queue_max_size
         )
+        self._current_topics: list[str] = []
+        self._resubscribe_needed = False
 
         # Idempotency — bounded FIFO set
         self._seen_ids: set[str] = set()
@@ -104,12 +106,27 @@ class EventsClient:
     # ── Registration ──────────────────────────────────────────────────
 
     def on(self, event_type: EventType, handler: AsyncEventHandler) -> None:
-        """Register an async handler. Call before start()."""
+        """
+        Register an async handler for an event type.
+
+        Safe to call before or after start(). If the consumer is already
+        running and this event type maps to a topic we're not yet
+        subscribed to, the poll thread picks up the change on its next
+        iteration.
+        """
         self._handlers[event_type].append(handler)
+        self._resubscribe_needed = True
 
     def on_many(self, event_types: list[EventType], handler: AsyncEventHandler) -> None:
+        """
+        Register the same handler for multiple event types.
+
+        Batches — only one resubscription even if the new types span
+        multiple new topics.
+        """
         for et in event_types:
-            self.on(et, handler)
+            self._handlers[et].append(handler)
+        self._resubscribe_needed = True
 
     # ── Produce ───────────────────────────────────────────────────────
 
@@ -147,7 +164,16 @@ class EventsClient:
     # ── Lifecycle ─────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Start consuming. No-op if no handlers registered (producer-only)."""
+        """
+        Start consuming. No-op if no handlers registered (producer-only).
+
+        Handlers registered after start() are picked up dynamically.
+        If a late handler needs a new topic, resubscription happens
+        automatically in on().
+        """
+        if self._running:
+            logger.warning("start() called but already running — ignoring.")
+            return
         if not self._handlers:
             logger.info("No handlers — producer-only mode.")
             return
@@ -155,12 +181,12 @@ class EventsClient:
             raise ValueError("consumer_group required when handlers are registered.")
 
         self._loop = asyncio.get_running_loop()
-        topics = self._subscribed_topics()
+        self._current_topics = self._subscribed_topics()
 
-        logger.info("Subscribing to %s (group=%s)", topics, self._consumer_group)
+        logger.info("Subscribing to %s (group=%s)", self._current_topics, self._consumer_group)
 
         self._consumer = Consumer(self._config.to_consumer_config(self._consumer_group))
-        self._consumer.subscribe(topics)
+        self._consumer.subscribe(self._current_topics)
         self._running = True
 
         self._loop.run_in_executor(None, self._poll_loop)
@@ -204,6 +230,19 @@ class EventsClient:
 
         while self._running:
             try:
+                # Check if new handlers need new topic subscriptions
+                if self._resubscribe_needed:
+                    self._resubscribe_needed = False
+                    needed = self._subscribed_topics()
+                    if needed != self._current_topics:
+                        logger.info(
+                            "Resubscribing: %s -> %s",
+                            self._current_topics,
+                            needed,
+                        )
+                        self._consumer.subscribe(needed)
+                        self._current_topics = needed
+
                 msg = self._consumer.poll(timeout=1.0)
                 if msg is None:
                     continue
