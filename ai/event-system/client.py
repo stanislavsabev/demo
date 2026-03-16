@@ -227,7 +227,7 @@ class EventsClient:
         """
         assert self._consumer is not None
         assert self._loop is not None
-
+ 
         while self._running:
             try:
                 # Check if new handlers need new topic subscriptions
@@ -242,7 +242,7 @@ class EventsClient:
                         )
                         self._consumer.subscribe(needed)
                         self._current_topics = needed
-
+ 
                 msg = self._consumer.poll(timeout=1.0)
                 if msg is None:
                     continue
@@ -250,12 +250,12 @@ class EventsClient:
                     if msg.error().code() != KafkaError._PARTITION_EOF:
                         logger.error("Consumer error: %s", msg.error())
                     continue
-
+ 
                 raw = msg.value()
                 if raw is None:
                     self._consumer.commit(msg, asynchronous=True)
                     continue
-
+ 
                 # Deserialize
                 try:
                     envelope = EventEnvelope.model_validate_json(raw)
@@ -266,7 +266,7 @@ class EventsClient:
                     )
                     self._consumer.commit(msg, asynchronous=True)
                     continue
-
+ 
                 # Dedup + relevance check
                 if (
                     envelope.meta.event_id in self._seen_ids
@@ -274,20 +274,44 @@ class EventsClient:
                 ):
                     self._consumer.commit(msg, asynchronous=True)
                     continue
-
-                # Enqueue — blocks if full (backpressure)
+ 
+                # Enqueue — blocks if full (backpressure).
+                # Retries with short timeouts so the thread stays
+                # responsive to shutdown signals (_running = False).
+                #
+                # If the queue stays full long enough that poll() isn't
+                # called within max.poll.interval.ms, Kafka evicts this
+                # consumer from the group. That's the intended behavior:
+                # a consumer that can't keep up should be replaced.
                 item = _QueueItem(envelope=envelope, raw_msg=msg)
-                asyncio.run_coroutine_threadsafe(
-                    self._queue.put(item), self._loop
-                ).result(timeout=30.0)
-
+                stall_seconds = 0.0
+                while self._running:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self._queue.put(item), self._loop
+                        ).result(timeout=2.0)
+                        break  # Enqueued successfully
+                    except TimeoutError:
+                        stall_seconds += 2.0
+                        max_poll_s = (
+                            self._config.consumer_max_poll_interval_ms / 1000
+                        )
+                        logger.warning(
+                            "Queue full for %.0fs (eviction at %.0fs) — "
+                            "handlers can't keep up, qsize=%d",
+                            stall_seconds,
+                            max_poll_s,
+                            self._queue.qsize(),
+                        )
+                        continue
+ 
             except KafkaException as exc:
                 logger.error("Kafka error: %s", exc)
                 time.sleep(1)
             except Exception:
                 logger.exception("Poll loop error")
                 time.sleep(1)
-
+ 
     # ── Dispatch task ─────────────────────────────────────────────────
 
     async def _dispatch_loop(self) -> None:
